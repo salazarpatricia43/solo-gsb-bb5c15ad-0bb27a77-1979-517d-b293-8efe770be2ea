@@ -50,6 +50,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `HOST`（容器内） | `0.0.0.0` | uvicorn 绑定地址 |
 | `PORT`（容器内） | `8000` | 容器内监听端口 |
 | `LOG_LEVEL` | `info` | uvicorn 日志级别 |
+| `MAX_BATCH_PLAN_COMBINATIONS` | `100000` | 批量数据方案组合上限（折叠过程中生成的并集组合数），超过返回 `422` |
 
 无数据库等其他依赖；策略保存在进程内存中，重启即清空。
 
@@ -71,6 +72,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | DELETE | `/api/v1/policies/{id}` | 删除策略 |
 | POST | `/api/v1/policies/{id}/evaluate` | 提交事实进行裁决 |
 | POST | `/api/v1/policies/{id}/counterfactuals` | 反事实搜索：让裁决唯一变为目标结论的最小修改集 |
+| POST | `/api/v1/policies/{id}/batch-data-plans` | 批量数据方案：让全部 unknown 案例可判定的最小全局字段集合 |
 
 ## 策略结构
 
@@ -242,15 +244,83 @@ curl -s -X POST localhost:8000/api/v1/policies/$PID/counterfactuals \
   （`MAX_COUNTERFACTUAL_COMBINATIONS = 100000`）；触顶时返回 `422` 并提示
   收窄 `candidates` 或减小 `max_changes`，以保证结果始终完整。
 
+## 批量数据方案示例（batch-data-plans）
+
+一次请求提交多个案例，逐案复用裁决引擎；仅对裁决为 `unknown` 的案例，把
+各自的 `minimal_missing_field_sets` 组合成**能让全部 unknown 案例同时可
+判定**的所有**包含关系最小**全局字段集合（即数据补全方案）。每个方案列出
+它覆盖的逐案最小集合；`decided` / `conflict` / `no_match` 案例不参与组合。
+
+请求体：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `cases` | 非空数组 | 元素为 `{"case_id": <非空字符串>, "facts": <对象>}`；`facts` 缺省视为 `{}`（缺失/null 字段仍为 unknown） |
+
+语义与约束：
+
+- `case_id` 在请求内必须唯一，重复返回 `422`；`cases` 为空、元素不是对象、
+  `facts` 非法等同样返回 `422`（响应体含 `errors` 列表）。
+- 组合过程持续去重并剪除严格超集；生成的并集组合数超过
+  `MAX_BATCH_PLAN_COMBINATIONS`（默认 `100000`，可用环境变量配置）时返回
+  `422`，**不会截断**结果。
+- 没有 `unknown` 案例时返回**一个空方案**：
+  `"plans": [{"fields": [], "covers": {}}]`。
+- 稳定排序：`cases` 按 `case_id`；`plans` 按字段数再按字段名；`covers`
+  按 `case_id` 给出每个 unknown 案例被该方案覆盖的逐案最小集合。
+
+```bash
+curl -s -X POST localhost:8000/api/v1/policies/$PID/batch-data-plans \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "cases": [
+      {"case_id": "applicant-1", "facts": {"income": 80000, "debt_ratio": 0.2}},
+      {"case_id": "applicant-2", "facts": {"income": 80000}},
+      {"case_id": "applicant-3", "facts": {}}
+    ]
+  }'
+```
+
+响应（节选）：
+
+```json
+{
+  "policy_id": "ab12...",
+  "case_count": 3,
+  "unknown_count": 2,
+  "cases": [
+    { "case_id": "applicant-1", "status": "decided", "conclusion": "approve" },
+    { "case_id": "applicant-2", "status": "unknown", "conclusion": null,
+      "missing_fields": ["debt_ratio"],
+      "minimal_missing_field_sets": [["debt_ratio"]] },
+    { "case_id": "applicant-3", "status": "unknown", "conclusion": null,
+      "missing_fields": ["debt_ratio"],
+      "minimal_missing_field_sets": [["debt_ratio"]] }
+  ],
+  "count": 1,
+  "plans": [
+    { "fields": ["debt_ratio"],
+      "covers": { "applicant-2": [["debt_ratio"]],
+                  "applicant-3": [["debt_ratio"]] } }
+  ]
+}
+```
+
+即：只要补全 `debt_ratio`，两个 unknown 案例所在优先级层即可判定。若各
+案例的最小集合互不相同，方案为逐案集合的并集组合（仍保持包含关系最小），
+例如某案例需要 `age`、另一案例需要 `flag` 或 `vip` 时，方案为
+`["age","flag"]` 与 `["age","vip"]` 两个。
+
 ## 项目结构
 
 ```
 app/
   main.py            # FastAPI 路由、健康检查、请求模型
-  validation.py      # 策略结构校验、反事实请求校验
+  validation.py      # 策略结构校验、反事实/批量请求校验
   logic.py           # 三值逻辑、最小决定族、比较可行性
   engine.py          # 优先级分层、冲突/未知/无匹配裁决、轨迹
   counterfactual.py  # 反事实最小修改集枚举、剪枝与稳定排序
+  batch.py           # 批量数据方案：逐案裁决、全局最小字段集合组合
   store.py           # 加锁的内存策略存储
 tests/               # 纯标准库 runner，也可用 pytest
 Dockerfile
@@ -265,5 +335,6 @@ pip install -r requirements-dev.txt
 python -m pytest tests/ -q
 # 或无需 pytest（tests 内置 runner）：
 python3 tests/test_logic.py && python3 tests/test_engine.py && \
-python3 tests/test_api.py && python3 tests/test_counterfactual.py
+python3 tests/test_api.py && python3 tests/test_counterfactual.py && \
+python3 tests/test_batch_data_plans.py
 ```

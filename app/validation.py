@@ -17,6 +17,8 @@ MAX_PRIORITY = 10**9
 MAX_ID_LENGTH = 200
 MAX_CONCLUSION_LENGTH = 500
 MAX_MAX_CHANGES = 100
+MAX_BATCH_CASES = 1000
+MAX_CASE_ID_LENGTH = 200
 
 
 class PolicyValidationError(ValueError):
@@ -234,3 +236,60 @@ def validate_counterfactual_request(payload: Any) -> tuple[dict, str, dict, int]
         raise PolicyValidationError(errors)
 
     return facts, target, normalized_candidates, max_changes
+
+
+def validate_batch_data_plans_request(payload: Any) -> list[dict]:
+    """Validate a batch data plans request body.
+
+    Returns the normalized ``cases`` list (one ``{"case_id", "facts"}`` dict
+    per case, ``facts`` defaulting to ``{}``); raises
+    :class:`PolicyValidationError` with one error string per detected problem.
+    """
+    errors: list[str] = []
+
+    if not isinstance(payload, dict):
+        raise PolicyValidationError(["request body must be an object"])
+
+    cases = payload.get("cases")
+    if not isinstance(cases, list) or not cases:
+        raise PolicyValidationError(["cases: must be a non-empty array"])
+    if len(cases) > MAX_BATCH_CASES:
+        errors.append(f"cases: at most {MAX_BATCH_CASES} cases are allowed")
+
+    seen_ids: set[str] = set()
+    normalized: list[dict] = []
+
+    for index, case in enumerate(cases):
+        prefix = f"cases[{index}]"
+        if not isinstance(case, dict):
+            errors.append(f"{prefix}: must be an object")
+            continue
+
+        case_id = case.get("case_id")
+        if not isinstance(case_id, str) or not case_id.strip():
+            errors.append(f"{prefix}.case_id: must be a non-empty string")
+        elif len(case_id) > MAX_CASE_ID_LENGTH:
+            errors.append(
+                f"{prefix}.case_id: must be at most "
+                f"{MAX_CASE_ID_LENGTH} characters"
+            )
+        elif case_id in seen_ids:
+            errors.append(f"{prefix}.case_id: duplicate case id {case_id!r}")
+        else:
+            seen_ids.add(case_id)
+
+        facts = case.get("facts", {})
+        if not isinstance(facts, dict) or not all(
+            isinstance(k, str) for k in facts
+        ):
+            errors.append(
+                f"{prefix}.facts: must be an object with string keys"
+            )
+            facts = {}
+
+        normalized.append({"case_id": case_id, "facts": facts})
+
+    if errors:
+        raise PolicyValidationError(errors)
+
+    return normalized

@@ -8,11 +8,13 @@ from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from .batch import BatchPlanSearchError, batch_data_plans
 from .counterfactual import CounterfactualSearchError, counterfactuals
 from .engine import adjudicate
 from .store import store
 from .validation import (
     PolicyValidationError,
+    validate_batch_data_plans_request,
     validate_counterfactual_request,
     validate_policy,
 )
@@ -26,8 +28,10 @@ app = FastAPI(
         "Submit policies built from all/any/not and comparison expressions; "
         "evaluate facts with three-valued (true/false/unknown) logic and "
         "receive priority-based verdicts with per-node derivation traces, "
-        "inclusion-minimal missing-field sets, and inclusion-minimal "
-        "counterfactual fact edits that force a target conclusion."
+        "inclusion-minimal missing-field sets, inclusion-minimal "
+        "counterfactual fact edits that force a target conclusion, and "
+        "batch data plans: inclusion-minimal global field sets that make "
+        "every unknown case decidable."
     ),
 )
 
@@ -57,6 +61,19 @@ async def counterfactual_search_handler(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         content={
             "detail": "Counterfactual search failed",
+            "errors": [str(exc)],
+        },
+    )
+
+
+@app.exception_handler(BatchPlanSearchError)
+async def batch_plan_search_handler(
+    request: Request, exc: BatchPlanSearchError
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={
+            "detail": "Batch data plan search failed",
             "errors": [str(exc)],
         },
     )
@@ -170,6 +187,32 @@ async def policy_counterfactuals(policy_id: str, request: Request) -> dict:
         "original_conclusion": original_verdict.get("conclusion"),
         "count": len(items),
         "counterfactuals": items,
+    }
+
+
+@app.post(
+    f"{API_PREFIX}/policies/{{policy_id}}/batch-data-plans",
+    tags=["adjudication"],
+)
+async def policy_batch_data_plans(policy_id: str, request: Request) -> dict:
+    """Combine unknown cases' minimal field sets into global data plans."""
+    record = store.get(policy_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Policy not found")
+
+    payload = await _json_body(request)
+    cases = validate_batch_data_plans_request(payload)
+
+    summaries, plans = batch_data_plans(record, cases)
+    return {
+        "policy_id": policy_id,
+        "case_count": len(summaries),
+        "unknown_count": sum(
+            1 for summary in summaries if summary["status"] == "unknown"
+        ),
+        "cases": summaries,
+        "count": len(plans),
+        "plans": plans,
     }
 
 
