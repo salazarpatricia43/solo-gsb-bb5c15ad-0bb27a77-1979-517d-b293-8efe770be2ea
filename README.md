@@ -50,6 +50,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `HOST`（容器内） | `0.0.0.0` | uvicorn 绑定地址 |
 | `PORT`（容器内） | `8000` | 容器内监听端口 |
 | `LOG_LEVEL` | `info` | uvicorn 日志级别 |
+| `MAX_BATCH_DATA_PLAN_COMBINATIONS` | `100000` | batch-data-plans 逐案组合时允许生成的组合数上限，触顶返回 `422` 而不截断结果 |
 
 无数据库等其他依赖；策略保存在进程内存中，重启即清空。
 
@@ -71,6 +72,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | DELETE | `/api/v1/policies/{id}` | 删除策略 |
 | POST | `/api/v1/policies/{id}/evaluate` | 提交事实进行裁决 |
 | POST | `/api/v1/policies/{id}/counterfactuals` | 反事实搜索：让裁决唯一变为目标结论的最小修改集 |
+| POST | `/api/v1/policies/{id}/batch-data-plans` | 批量案例：组合出覆盖全部 unknown 案例的包含关系最小全局字段方案 |
 
 ## 策略结构
 
@@ -242,15 +244,90 @@ curl -s -X POST localhost:8000/api/v1/policies/$PID/counterfactuals \
   （`MAX_COUNTERFACTUAL_COMBINATIONS = 100000`）；触顶时返回 `422` 并提示
   收窄 `candidates` 或减小 `max_changes`，以保证结果始终完整。
 
+## 批量数据方案示例（batch-data-plans）
+
+一次提交多个案例（各自带**唯一** `case_id` 与 `facts`），服务逐案复用现有
+裁决引擎。已可判定的案例（`decided` / `conflict` / `no_match`）无需补字段；
+仅对 `unknown` 案例取其逐案 `minimal_missing_field_sets`，再组合出**能让全部
+unknown 案例可判定**的所有**包含关系最小全局字段集合**。每个全局方案的
+`covered` 列出它在每个 unknown 案例上覆盖到的逐案最小集合。
+
+请求体：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `cases` | 非空数组（至多 1000 项） | 每项为 `{"case_id": <非空字符串>, "facts": <object>}` |
+| `cases[].case_id` | 非空字符串 | 案例标识，同一请求内**不得重复**（重复返回 `422`） |
+| `cases[].facts` | object | 该案例的事实；缺省视为 `{}`，缺失/null 字段仍为 unknown |
+
+```bash
+curl -s -X POST localhost:8000/api/v1/policies/$PID/batch-data-plans \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "cases": [
+      {"case_id": "c1", "facts": {"d": 0}},
+      {"case_id": "c2", "facts": {"b": 0}}
+    ]
+  }'
+```
+
+以上例中规则为 `any(a==1, b==1, d==1)`：c1（`d` 已为假）的逐案最小集合是
+`[a] / [b]`，c2（`b` 已为假）的是 `[a] / [d]`。跨案并集后 `{a}` 使两案都可
+判定，`{a,b}`、`{a,d}` 因是其严格超集被剪除，只剩 `{a}` 与 `{b,d}`：
+
+```json
+{
+  "policy_id": "ab12...",
+  "count": 2,
+  "unknown_case_ids": ["c1", "c2"],
+  "cases": [
+    {"case_id": "c1", "status": "unknown", "conclusion": null,
+     "decided_priority": 10,
+     "minimal_missing_field_sets": [["a"], ["b"]]},
+    {"case_id": "c2", "status": "unknown", "conclusion": null,
+     "decided_priority": 10,
+     "minimal_missing_field_sets": [["a"], ["d"]]}
+  ],
+  "plans": [
+    {"fields": ["a"],
+     "covered": [
+       {"case_id": "c1", "minimal_missing_field_sets": [["a"]]},
+       {"case_id": "c2", "minimal_missing_field_sets": [["a"]]}
+     ]},
+    {"fields": ["b", "d"],
+     "covered": [
+       {"case_id": "c1", "minimal_missing_field_sets": [["b"]]},
+       {"case_id": "c2", "minimal_missing_field_sets": [["d"]]}
+     ]}
+  ]
+}
+```
+
+组合语义：
+
+- 全局方案 = 为每个 unknown 案例各选一个逐案最小集合后取字段并集；组合过程
+  持续去重并剪除严格超集（任一案例在各步后都重新做包含关系最小化）。
+- 字段被多个案例共享时自动合并（如上例的 `a`），不会重复计数。
+- **没有 unknown 案例**时返回一个空方案：
+  `"plans": [{"fields": [], "covered": []}]`，`"count": 1`。
+- 每个方案的 `covered` 按 `case_id` 排序；方案整体先按字段数升序、再按字段名
+  字典序稳定排序，因此结果顺序与请求中案例顺序无关。
+- 非法请求（`cases` 为空/非数组、`case_id` 缺失或重复、`facts` 类型错误等）
+  返回 `422`，响应体含 `errors` 列表。
+- 为防止逐案最小集合的交叉积组合爆炸，生成组合数设有可配置上限
+  （`MAX_BATCH_DATA_PLAN_COMBINATIONS`，默认 `100000`，可用环境变量调整）；
+  触顶时返回 `422` 并提示减小 unknown 案例数或调大上限，**绝不截断结果**。
+
 ## 项目结构
 
 ```
 app/
   main.py            # FastAPI 路由、健康检查、请求模型
-  validation.py      # 策略结构校验、反事实请求校验
+  validation.py      # 策略结构校验、反事实/批量请求校验
   logic.py           # 三值逻辑、最小决定族、比较可行性
   engine.py          # 优先级分层、冲突/未知/无匹配裁决、轨迹
   counterfactual.py  # 反事实最小修改集枚举、剪枝与稳定排序
+  batch.py           # 批量逐案裁决复用、全局字段方案组合/剪枝/上限
   store.py           # 加锁的内存策略存储
 tests/               # 纯标准库 runner，也可用 pytest
 Dockerfile
@@ -265,5 +342,6 @@ pip install -r requirements-dev.txt
 python -m pytest tests/ -q
 # 或无需 pytest（tests 内置 runner）：
 python3 tests/test_logic.py && python3 tests/test_engine.py && \
-python3 tests/test_api.py && python3 tests/test_counterfactual.py
+python3 tests/test_api.py && python3 tests/test_counterfactual.py && \
+python3 tests/test_batch.py
 ```

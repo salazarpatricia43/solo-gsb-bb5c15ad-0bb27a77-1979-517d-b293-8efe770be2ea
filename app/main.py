@@ -8,11 +8,13 @@ from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from .batch import BatchDataPlanError, batch_data_plans
 from .counterfactual import CounterfactualSearchError, counterfactuals
 from .engine import adjudicate
 from .store import store
 from .validation import (
     PolicyValidationError,
+    validate_batch_data_plans_request,
     validate_counterfactual_request,
     validate_policy,
 )
@@ -57,6 +59,19 @@ async def counterfactual_search_handler(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         content={
             "detail": "Counterfactual search failed",
+            "errors": [str(exc)],
+        },
+    )
+
+
+@app.exception_handler(BatchDataPlanError)
+async def batch_data_plan_handler(
+    request: Request, exc: BatchDataPlanError
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={
+            "detail": "Batch data-plan combination failed",
             "errors": [str(exc)],
         },
     )
@@ -170,6 +185,29 @@ async def policy_counterfactuals(policy_id: str, request: Request) -> dict:
         "original_conclusion": original_verdict.get("conclusion"),
         "count": len(items),
         "counterfactuals": items,
+    }
+
+
+@app.post(
+    f"{API_PREFIX}/policies/{{policy_id}}/batch-data-plans",
+    tags=["adjudication"],
+)
+async def policy_batch_data_plans(policy_id: str, request: Request) -> dict:
+    """Combine per-case minimal missing-field sets into global data plans."""
+    record = store.get(policy_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Policy not found")
+
+    payload = await _json_body(request)
+    cases = validate_batch_data_plans_request(payload)
+
+    result = batch_data_plans(record, cases)
+    return {
+        "policy_id": policy_id,
+        "count": len(result["plans"]),
+        "unknown_case_ids": result["unknown_case_ids"],
+        "cases": result["cases"],
+        "plans": result["plans"],
     }
 
 
